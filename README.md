@@ -55,7 +55,7 @@ The fallback AP starts even if station credentials are used. Its default IP is `
 
 ## UI and REST API
 
-The mobile UI displays pressure, target, AUTO/MANUAL, valve motion, fault, ADC values, Wi-Fi and uptime; it refreshes every 500 ms. Controls are target set, AUTO on/off, OPEN/CLOSE 100/300 ms, STOP, and a guarded zero-calibration action. STOP also turns AUTO off.
+The mobile UI displays pressure, target, AUTO/MANUAL, valve motion, fault, ADC values, Wi-Fi and uptime; it refreshes every 500 ms. Controls are target set, a status-aware AUTO toggle, OPEN/CLOSE 100/300 ms, STOP, and a guarded zero-calibration action. STOP also turns AUTO off.
 
 - `GET /api/status`
 - `POST /api/setpoint` form field `psi`: finite 0–100, persisted in Preferences
