@@ -58,7 +58,7 @@ The fallback AP starts even if station credentials are used. Its default IP is `
 The mobile UI displays pressure, raw pressure, target, AUTO/MANUAL, valve motion, fault, ADC values, Wi-Fi and uptime; it refreshes every 500 ms. The browser-only simulator uses a nonlinear valve-flow curve, fixed nozzle, variable supply-pressure profiles, and configurable response lag. Its auto-tuner searches simulation scenarios only. Copying a candidate fills the settings form; a separate save action persists it to the controller. Simulation actions never command the valve.
 
 - `GET /api/status`
-- `GET /api/config` and `POST /api/config`: read or persist bounded filter, controller, travel-time, and overtravel settings
+- `GET /api/config` and `POST /api/config`: read or persist bounded filter, near-zero clamp, controller, travel-time, and overtravel settings
 - `POST /api/setpoint` form field `psi`: finite 0–100, persisted in Preferences
 - `POST /api/auto` field `enabled=0|1`
 - `POST /api/pulse` fields `direction=open|close`, integer `ms=20..1000`; allowed only during a matching bounded reference session
@@ -71,7 +71,7 @@ The local UI/API has no user authentication. Keep the AP password private and us
 
 ## Pressure conversion and calibration
 
-Firmware uses ADC1, 11 dB attenuation, sixteen `analogReadMilliVolts()` samples, and a configurable EMA with default alpha 0.10 (approximately a 0.5-second time constant at 20 Hz). Conversion:
+Firmware uses ADC1, 11 dB attenuation, sixteen `analogReadMilliVolts()` samples, and a configurable EMA with default alpha 0.10 (approximately a 0.5-second time constant at 20 Hz). The filtered/control value is clamped to exactly zero inside a configurable ±0.50 PSI band by default; set the band to 0 to disable it. Raw pressure remains unclamped for diagnostics. Conversion:
 
 ```text
 sensorVoltage = adcVoltage / (2/3)
@@ -79,7 +79,7 @@ rawPressurePsi = (sensorVoltage - 0.5) * 37.5
 calibratedPressure = rawPressurePsi * PRESSURE_GAIN + PRESSURE_OFFSET_PSI
 ```
 
-The default gain is 1.0 and default offset is 0.0. The UI's **Capture 3-second atmospheric zero** action computes and saves one offset persistently in ESP32 Preferences; it is kept across reboot and firmware uploads. Use it only with a gauge-pressure sensor truly vented to atmosphere, correct divider wiring, AUTO off, and the valve stopped. The endpoint rejects unstable samples and corrections larger than 30 PSI. Zeroing corrects only the offset; it does not verify the span or divider ratio. The offset is held fixed until the next capture.
+The default gain is 1.0 and default offset is 0.0. The UI's **Capture 3-second atmospheric zero** action computes and saves one offset persistently in ESP32 Preferences; it is kept across reboot and firmware uploads. Use it only with a gauge-pressure sensor truly vented to atmosphere, correct divider wiring, AUTO off, and the valve stopped. The endpoint rejects unstable samples and corrections larger than 30 PSI. Zeroing corrects only the offset; it does not verify the span or divider ratio. The offset is held fixed until the next capture. The separate near-zero clamp suppresses small residual fluctuations around zero; its threshold is adjustable in controller settings and raw readings remain available.
 
 Compare firmware to a known mechanical gauge at two pressures before enabling closed-loop control:
 
