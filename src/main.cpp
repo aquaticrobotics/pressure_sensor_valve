@@ -152,7 +152,7 @@ void zeroPressure(){
   float newOffset=-medianRaw*Cfg::PRESSURE_GAIN;if(!isfinite(newOffset)||fabsf(newOffset)>Cfg::MAX_ZERO_OFFSET_PSI)return errorJson(409,"Zero correction exceeds the safe 30 PSI limit; inspect sensor and divider");
   if(prefs.putFloat("zero_offset",newOffset)!=sizeof(float))return errorJson(500,"Could not save zero calibration");
   pressureOffsetPsi=newOffset;pressureReady=false;filteredPsi=NAN;clearZeroHistory();lastError="";lastAction="zero_calibrated";logEvent("zero_calibrated");
-  char out[160];snprintf(out,sizeof(out),"{\"ok\":true,\"message\":\"Zero saved at %.2f PSI raw; offset %.2f PSI\",\"rawAtZero\":%.3f,\"offsetPsi\":%.3f}",medianRaw,newOffset,newOffset);server.send(200,"application/json",out);
+  char out[160];snprintf(out,sizeof(out),"{\"ok\":true,\"message\":\"Zero saved at %.2f PSI raw; offset %.2f PSI\",\"rawAtZero\":%.3f,\"offsetPsi\":%.3f}",medianRaw,newOffset,medianRaw,newOffset);server.send(200,"application/json",out);
 }
 
 void setupRoutes(){const char* h[]={"Origin"};server.collectHeaders(h,1);server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",PAGE);});server.on("/api/status",HTTP_GET,status);server.on("/api/setpoint",HTTP_POST,setpoint);server.on("/api/auto",HTTP_POST,automatic);server.on("/api/pulse",HTTP_POST,manualPulse);server.on("/api/stop",HTTP_POST,stopRequest);server.on("/api/zero",HTTP_POST,zeroPressure);server.onNotFound([]{server.send(404,"application/json","{\"ok\":false,\"error\":\"Not found\"}");});}
