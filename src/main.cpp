@@ -5,12 +5,14 @@
 #include <ArduinoOTA.h>
 #include <math.h>
 #include <stdlib.h>
-
+#include <string.h>
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
 #include "secrets.example.h"
 #endif
+#include "ui.h"
+
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
 #endif
@@ -28,161 +30,72 @@
 #endif
 
 namespace Cfg {
-constexpr uint8_t DIR_PIN=25, PWM_PIN=26, PRESSURE_PIN=34;
-constexpr uint8_t DIR_OPEN_LEVEL=HIGH;
-constexpr float SENSOR_MIN_V=0.5f, SENSOR_MAX_V=4.5f, SENSOR_FS_PSI=150.0f;
-constexpr float DIVIDER_TOP=10000.0f, DIVIDER_BOTTOM=20000.0f;
-constexpr float DIVIDER_RATIO=DIVIDER_BOTTOM/(DIVIDER_TOP+DIVIDER_BOTTOM);
-constexpr float PRESSURE_GAIN=1.0f, PRESSURE_OFFSET_PSI=0.0f;
-constexpr float SENSOR_FAULT_LOW_V=0.20f, SENSOR_FAULT_HIGH_V=4.80f;
-constexpr uint8_t ADC_SAMPLES=16;
-constexpr uint8_t ZERO_HISTORY_SAMPLES=20;
-constexpr float ZERO_HISTORY_MAX_SPREAD_PSI=1.0f;
-constexpr float MAX_ZERO_OFFSET_PSI=30.0f;
-constexpr float FILTER_ALPHA=0.20f;
-constexpr float DEFAULT_TARGET_PSI=40.0f, DEADBAND_PSI=0.75f;
-constexpr float MAX_SETPOINT_PSI=100.0f, HARD_MAX_PRESSURE_PSI=120.0f;
-constexpr float OVERPRESSURE_CLEAR_PSI=115.0f;
-constexpr uint32_t CONTROL_INTERVAL_MS=100, SETTLE_MS=400;
-constexpr uint32_t MIN_PULSE_MS=20, MAX_PULSE_MS=1000, VALVE_FULL_TRAVEL_MS=4500;
+constexpr uint8_t DIR_PIN=25, PWM_PIN=26, PRESSURE_PIN=34, DIR_OPEN_LEVEL=HIGH, ADC_SAMPLES=16, ZERO_SAMPLES=60;
+constexpr float SENSOR_MIN_V=.5f,SENSOR_MAX_V=4.5f,SENSOR_FS_PSI=150.f,DIVIDER_RATIO=2.f/3.f,PRESSURE_GAIN=1.f;
+constexpr float SENSOR_FAULT_LOW_V=.20f,SENSOR_FAULT_HIGH_V=4.80f,MAX_ZERO_OFFSET_PSI=30.f,MAX_SETPOINT_PSI=100.f,HARD_MAX_PRESSURE_PSI=120.f,OVERPRESSURE_CLEAR_PSI=115.f;
+constexpr uint32_t MIN_PULSE_MS=20,MAX_PULSE_MS=1000,MIN_TRAVEL_MS=100,MAX_TRAVEL_MS=120000,MAX_OVERTRAVEL_MS=1000;
 }
+struct TuningConfig {
+  float filterAlpha=.10f,deadbandPsi=.75f,error1Psi=1.5f,error2Psi=3.f,error3Psi=6.f;
+  uint32_t controlIntervalMs=100,settleMs=400,pulse1Ms=70,pulse2Ms=110,pulse3Ms=200,pulse4Ms=325;
+  uint32_t openTravelMs=4500,closeTravelMs=4500,openOvertravelMs=0,closeOvertravelMs=0;
+};
+WebServer server(80); Preferences prefs; TuningConfig tuning;
+enum class Mode:uint8_t{MANUAL,AUTO}; enum class Motion:uint8_t{STOPPED,OPENING,CLOSING}; enum class Fault:uint8_t{NONE,SENSOR,OVERPRESSURE}; enum class RefDir:uint8_t{NONE,OPEN,CLOSE};
+Mode mode=Mode::MANUAL; Motion motion=Motion::STOPPED; Fault fault=Fault::NONE; RefDir refDir=RefDir::NONE;
+float targetPsi=20.f,adcMv=0,adcV=0,sensorV=0,rawPsi=0,filteredPsi=NAN,pressureOffsetPsi=0,estimatedPosition=0;
+float zeroSamples[Cfg::ZERO_SAMPLES]{}; uint8_t zeroCount=0,goodSamples=0; uint32_t zeroStart=0,pulseStart=0,pulseEnd=0,settleUntil=0,lastRead=0,lastControl=0,referenceUsed=0;
+bool sensorValid=false,pressureReady=false,stationConnected=false,zeroActive=false,positionKnown=false,pulseOpen=false;
+String lastAction="boot_safe",lastError="",zeroError="",stationSsid="",stationPassword="",wifiError="",wifiState="idle",pendingSsid="",pendingPassword="",previousSsid="",previousPassword="";
+bool wifiChangePending=false,wifiRollback=false,wifiSwitchScheduled=false; uint32_t wifiAttemptStart=0,wifiSwitchAt=0;
 
-WebServer server(80);
-Preferences prefs;
-enum class Mode:uint8_t { MANUAL, AUTO };
-enum class Motion:uint8_t { STOPPED, OPENING, CLOSING };
-enum class Fault:uint8_t { NONE, SENSOR, OVERPRESSURE };
-Mode mode=Mode::MANUAL;
-Motion motion=Motion::STOPPED;
-Fault fault=Fault::NONE;
-float targetPsi=Cfg::DEFAULT_TARGET_PSI, adcMv=0, adcV=0, sensorV=0;
-float rawPsi=0, filteredPsi=NAN, estimatedPosition=50.0f, pressureOffsetPsi=Cfg::PRESSURE_OFFSET_PSI;
-float zeroHistory[Cfg::ZERO_HISTORY_SAMPLES]{};
-uint8_t zeroHistoryCount=0, zeroHistoryNext=0;
-uint32_t pulseEndMs=0, pulseStartMs=0, settleUntilMs=0, lastControlMs=0, lastReadMs=0, lastLogMs=0;
-uint8_t goodSamples=0;
-bool sensorValid=false, pressureReady=false, stationConnected=false, pulseIsOpen=false;
-String lastAction="boot_safe", lastError="";
-
-const char PAGE[] PROGMEM=R"HTML(
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sprinkler pressure</title><style>
-:root{color-scheme:dark;--bg:#101820;--panel:#1c2a35;--ink:#edf4f7;--muted:#a9bbc6;--accent:#47c6a5;--warn:#ffbf55;--bad:#ff6868}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}.wrap{max-width:900px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:var(--panel);border-radius:14px;padding:16px}.hero{font-size:clamp(2.3rem,8vw,4rem);font-weight:750;line-height:1.1}.label{color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.value{font-size:1.25rem;margin-top:6px}.fault{font-weight:800;color:var(--accent)}.fault.bad{color:var(--bad)}.fault.warn{color:var(--warn)}input,button{font:inherit;border:0;border-radius:9px;padding:11px}input{width:120px;background:#0e171e;color:var(--ink);border:1px solid #50616c}button{background:#304550;color:var(--ink);cursor:pointer;margin:4px 4px 4px 0}button.primary,button.auto-toggle[aria-pressed="true"]{background:#168d76}button.stop{background:#9d343c}button:disabled{opacity:.7;cursor:wait}.row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:10px}.small{color:var(--muted);font-size:.9rem}.notice{padding:12px;border-left:4px solid var(--warn);background:#2b2a22;border-radius:6px;margin:14px 0}details{margin-top:14px}pre{white-space:pre-wrap;color:var(--muted)}
-</style></head><body><main class="wrap"><h1>Sprinkler pressure</h1><div id="notice" class="notice">AUTO is off until explicitly enabled. Keep it off until commissioning is complete.</div><section class="grid"><article class="card"><div class="label">Current pressure</div><div class="hero"><span id="pressure">--</span> <small>PSI</small></div></article><article class="card"><div class="label">Target pressure</div><div class="value"><span id="target">--</span> PSI</div><div class="row"><input id="setpoint" type="number" min="0" max="100" step="0.1" value="40" aria-label="Target PSI"><button class="primary" onclick="setTarget()">Set target</button></div></article><article class="card"><div class="label">System</div><div id="fault" class="value fault">--</div><div class="small">Mode: <span id="mode">--</span> · Valve: <span id="valve">--</span></div></article></section><section class="card" style="margin-top:12px"><div class="label">Controls</div><div class="row"><button class="auto-toggle" id="auto-toggle" type="button" aria-pressed="false" disabled onclick="toggleAuto()">AUTO: CHECKING…</button><button class="stop" onclick="post('/api/stop')">STOP</button></div><div class="row"><button onclick="pulse('open',100)">OPEN 100 ms</button><button onclick="pulse('close',100)">CLOSE 100 ms</button><button onclick="pulse('open',300)">OPEN 300 ms</button><button onclick="pulse('close',300)">CLOSE 300 ms</button></div><div id="message" class="small" role="status"></div></section><details class="card"><summary>Diagnostics and zero calibration</summary><p class="small">To zero a gauge sensor, vent its pressure port to atmosphere, keep the valve stopped in MANUAL, and confirm the installed divider is correct. Zeroing only adjusts offset; it cannot fix wiring or verify pressure span.</p><button onclick="zeroSensor()">Zero sensor at atmosphere</button><pre id="diag">Loading…</pre></details><p class="small">Connection: <span id="wifi">--</span> · Uptime: <span id="uptime">--</span></p></main><script>
-let currentMode=null,autoBusy=false;
-function updateAutoToggle(){let b=document.querySelector('#auto-toggle');if(!b)return;let isAuto=currentMode==='auto';b.textContent=currentMode===null?'AUTO: CHECKING…':isAuto?'AUTO: ON · TAP TO TURN OFF':'AUTO: OFF · TAP TO TURN ON';b.setAttribute('aria-pressed',String(isAuto));b.disabled=currentMode===null||autoBusy}
-async function post(path,body=''){try{let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}),j=await r.json();document.querySelector('#message').textContent=j.error||j.message||'OK';if(!r.ok)throw Error(j.error||'Request failed');await refresh()}catch(e){document.querySelector('#message').textContent=e.message}}
-function setTarget(){post('/api/setpoint','psi='+encodeURIComponent(document.querySelector('#setpoint').value))}async function toggleAuto(){if(autoBusy||currentMode===null)return;autoBusy=true;updateAutoToggle();await post('/api/auto','enabled='+(currentMode==='auto'?0:1));autoBusy=false;updateAutoToggle()}function pulse(d,ms){post('/api/pulse','direction='+d+'&ms='+ms)}function zeroSensor(){if(confirm('Confirm the pressure port is open to atmosphere and the divider is wired correctly. This stores a zero offset only; it does not verify pressure span. Keep AUTO off until checked against a known gauge. Continue?'))post('/api/zero','confirmed=1')}
-async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'}),s=await r.json();currentMode=s.mode;updateAutoToggle();document.querySelector('#pressure').textContent=s.pressure===null?'--':Number(s.pressure).toFixed(1);document.querySelector('#target').textContent=Number(s.target).toFixed(1);document.querySelector('#setpoint').value=s.target;document.querySelector('#mode').textContent=s.mode;document.querySelector('#valve').textContent=s.valve;let f=document.querySelector('#fault');f.textContent=s.system.toUpperCase();f.className='value fault'+(s.fault==='sensor'?' bad':s.fault==='overpressure'?' warn':'');document.querySelector('#wifi').textContent=s.wifi+' · '+s.ip;document.querySelector('#uptime').textContent=Math.floor(s.uptimeMs/1000)+' s';document.querySelector('#diag').textContent=`ADC: ${s.adcMillivolts} mV (${s.adcVoltage.toFixed(3)} V)\nSensor: ${s.sensorVoltage.toFixed(3)} V\nRaw: ${s.rawPressure.toFixed(2)} PSI\nZero offset: ${s.pressureOffsetPsi.toFixed(2)} PSI\nFiltered: ${s.pressure===null?'invalid':s.pressure.toFixed(2)+' PSI'}\nLast action: ${s.lastAction}\nEstimated position: ${s.valvePosition.toFixed(1)}% (diagnostic only)\nWi-Fi RSSI: ${s.wifiRssi} dBm\nLast error: ${s.lastError||'none'}`;document.querySelector('#notice').textContent=s.warning}catch(e){document.querySelector('#message').textContent='Status unavailable'}}setInterval(refresh,500);refresh();
-</script></body></html>
-)HTML";
-
-const char* modeName(){return mode==Mode::AUTO?"auto":"manual";}
-const char* motionName(){return motion==Motion::OPENING?"opening":motion==Motion::CLOSING?"closing":"stopped";}
-const char* faultName(){return fault==Fault::SENSOR?"sensor":fault==Fault::OVERPRESSURE?"overpressure":"none";}
-bool reached(uint32_t now,uint32_t deadline){return static_cast<int32_t>(now-deadline)>=0;}
-void clearZeroHistory(){zeroHistoryCount=0;zeroHistoryNext=0;}
-void addZeroSample(float psi){zeroHistory[zeroHistoryNext]=psi;zeroHistoryNext=(zeroHistoryNext+1)%Cfg::ZERO_HISTORY_SAMPLES;if(zeroHistoryCount<Cfg::ZERO_HISTORY_SAMPLES)++zeroHistoryCount;}
-bool zeroHistoryStats(float& center,float& spread){
-  if(zeroHistoryCount<Cfg::ZERO_HISTORY_SAMPLES)return false;
-  float sorted[Cfg::ZERO_HISTORY_SAMPLES];
-  for(uint8_t i=0;i<zeroHistoryCount;i++){
-    float value=zeroHistory[i];uint8_t j=i;
-    while(j>0&&sorted[j-1]>value){sorted[j]=sorted[j-1];--j;}
-    sorted[j]=value;
+bool due(uint32_t now,uint32_t deadline){return int32_t(now-deadline)>=0;}
+const char* modeName(){return mode==Mode::AUTO?"auto":"manual";} const char* motionName(){return motion==Motion::STOPPED?"stopped":motion==Motion::OPENING?"opening":"closing";}
+const char* faultName(){return fault==Fault::NONE?"none":fault==Fault::SENSOR?"sensor":"overpressure";}
+String jsonEscape(const String& s){String o;for(size_t i=0;i<s.length();++i){char c=s[i];if(c=='"'||c=='\\')o+='\\';if((uint8_t)c>=32)o+=c;}return o;}
+void logEvent(const char* what){Serial.printf("[%lu] %s pressure=%.2f raw=%.2f target=%.2f mode=%s valve=%s fault=%s\n",(unsigned long)millis(),what,pressureReady?filteredPsi:NAN,rawPsi,targetPsi,modeName(),motionName(),faultName());}
+void updatePosition(uint32_t elapsed){if(!positionKnown)return;uint32_t travel=pulseOpen?tuning.openTravelMs:tuning.closeTravelMs;float delta=100.f*elapsed/travel;estimatedPosition=constrain(estimatedPosition+(pulseOpen?delta:-delta),0.f,100.f);}
+void stopValve(const char* why){digitalWrite(Cfg::PWM_PIN,LOW);if(motion!=Motion::STOPPED){uint32_t now=millis(),elapsed=now-pulseStart;updatePosition(elapsed);if(refDir!=RefDir::NONE&&((refDir==RefDir::OPEN)==pulseOpen))referenceUsed+=elapsed;motion=Motion::STOPPED;settleUntil=now+tuning.settleMs;lastAction=why;logEvent(why);}}
+bool startPulse(bool open,uint32_t ms,const char* origin){uint32_t now=millis();if(motion!=Motion::STOPPED||!due(now,settleUntil))return false;ms=constrain(ms,Cfg::MIN_PULSE_MS,Cfg::MAX_PULSE_MS);
+  if(origin[0]=='a'&&!positionKnown)return false;
+  if(origin[0]=='m'||origin[0]=='a'){
+    if(refDir!=RefDir::NONE){uint32_t limit=(refDir==RefDir::OPEN?tuning.openTravelMs+tuning.openOvertravelMs:tuning.closeTravelMs+tuning.closeOvertravelMs);if((refDir==RefDir::OPEN)!=open||referenceUsed+ms>limit)return false;}
+    else{if(!positionKnown)return false;float travel=open?tuning.openTravelMs*(100.f-estimatedPosition)/100.f:tuning.closeTravelMs*estimatedPosition/100.f;uint32_t extra=open?tuning.openOvertravelMs:tuning.closeOvertravelMs;if(ms>travel+extra)return false;}
   }
-  uint8_t lowIndex=zeroHistoryCount/10,highIndex=(zeroHistoryCount*9)/10;
-  center=(sorted[(zeroHistoryCount-1)/2]+sorted[zeroHistoryCount/2])*0.5f;
-  spread=sorted[highIndex]-sorted[lowIndex];
-  return isfinite(center)&&isfinite(spread);
+  digitalWrite(Cfg::PWM_PIN,LOW);digitalWrite(Cfg::DIR_PIN,open?Cfg::DIR_OPEN_LEVEL:!Cfg::DIR_OPEN_LEVEL);delayMicroseconds(20);digitalWrite(Cfg::PWM_PIN,HIGH);pulseStart=now;pulseEnd=now+ms;pulseOpen=open;motion=open?Motion::OPENING:Motion::CLOSING;lastAction=String(origin)+(open?"_open_":"_close_")+String(ms)+"ms";return true;}
+void servicePulse(){if(motion!=Motion::STOPPED&&due(millis(),pulseEnd))stopValve("pulse_complete");}
+void updatePressure(){uint32_t now=millis();if(now-lastRead<50)return;lastRead=now;uint32_t total=0;for(uint8_t i=0;i<Cfg::ADC_SAMPLES;i++){total+=analogReadMilliVolts(Cfg::PRESSURE_PIN);delayMicroseconds(100);}adcMv=(float)total/Cfg::ADC_SAMPLES;adcV=adcMv/1000.f;sensorV=adcV/Cfg::DIVIDER_RATIO;rawPsi=(sensorV-Cfg::SENSOR_MIN_V)/(Cfg::SENSOR_MAX_V-Cfg::SENSOR_MIN_V)*Cfg::SENSOR_FS_PSI;sensorValid=isfinite(sensorV)&&sensorV>=Cfg::SENSOR_FAULT_LOW_V&&sensorV<=Cfg::SENSOR_FAULT_HIGH_V;
+  if(!sensorValid){goodSamples=0;fault=Fault::SENSOR;mode=Mode::MANUAL;zeroActive=false;zeroError="Sensor invalid during capture";stopValve("sensor_fault_stop");lastError="Pressure sensor outside 0.20–4.80 V";return;}
+  if(goodSamples<5)++goodSamples;if(goodSamples>=5&&fault==Fault::SENSOR){fault=Fault::NONE;lastError="";pressureReady=false;}
+  float calibrated=rawPsi*Cfg::PRESSURE_GAIN+pressureOffsetPsi;if(!pressureReady){filteredPsi=calibrated;pressureReady=true;}else filteredPsi=tuning.filterAlpha*calibrated+(1.f-tuning.filterAlpha)*filteredPsi;
+  if(zeroActive){if(mode!=Mode::MANUAL||motion!=Motion::STOPPED||!due(millis(),settleUntil)||!sensorValid){zeroActive=false;zeroError="Capture canceled: controller state changed";}else if(zeroCount<Cfg::ZERO_SAMPLES)zeroSamples[zeroCount++]=rawPsi;
+    if(zeroActive&&zeroCount>=Cfg::ZERO_SAMPLES&&millis()-zeroStart>=3000){float sorted[Cfg::ZERO_SAMPLES];memcpy(sorted,zeroSamples,sizeof(sorted));for(uint8_t i=1;i<Cfg::ZERO_SAMPLES;i++){float v=sorted[i];int j=i-1;while(j>=0&&sorted[j]>v){sorted[j+1]=sorted[j];--j;}sorted[j+1]=v;}float med=(sorted[29]+sorted[30])*.5f,spread=sorted[53]-sorted[6],off=-med*Cfg::PRESSURE_GAIN;
+      if(spread>1.f)zeroError="Capture rejected: samples were unstable";else if(!isfinite(off)||fabsf(off)>Cfg::MAX_ZERO_OFFSET_PSI)zeroError="Capture rejected: correction exceeds 30 PSI";else if(prefs.putFloat("zero_offset",off)!=sizeof(float))zeroError="Capture failed: could not save offset";else{pressureOffsetPsi=off;filteredPsi=0;pressureReady=true;lastAction="zero_calibrated";zeroError="Zero saved from stable 3-second capture";logEvent("zero_calibrated");}zeroActive=false;}}
 }
-void logEvent(const char* what){Serial.printf("[%lu] %s PSI=%.2f target=%.2f ADC=%.3fV sensor=%.3fV mode=%s valve=%s fault=%s\n",(unsigned long)millis(),what,pressureReady?filteredPsi:NAN,targetPsi,adcV,sensorV,modeName(),motionName(),faultName());}
-
-void stopValve(const char* why="stop"){
-  digitalWrite(Cfg::PWM_PIN,LOW);
-  if(motion!=Motion::STOPPED){uint32_t now=millis(),elapsed=now-pulseStartMs;float delta=100.0f*elapsed/Cfg::VALVE_FULL_TRAVEL_MS;estimatedPosition=constrain(estimatedPosition+(pulseIsOpen?delta:-delta),0.0f,100.0f);motion=Motion::STOPPED;settleUntilMs=now+Cfg::SETTLE_MS;lastAction=why;logEvent(why);}
-}
-bool startPulse(bool open,uint32_t ms,const char* origin){
-  uint32_t now=millis();if(motion!=Motion::STOPPED||!reached(now,settleUntilMs))return false;
-  ms=constrain(ms,Cfg::MIN_PULSE_MS,Cfg::MAX_PULSE_MS);
-  digitalWrite(Cfg::PWM_PIN,LOW);digitalWrite(Cfg::DIR_PIN,open?Cfg::DIR_OPEN_LEVEL:!Cfg::DIR_OPEN_LEVEL);delayMicroseconds(20);digitalWrite(Cfg::PWM_PIN,HIGH);
-  pulseStartMs=now;pulseEndMs=now+ms;pulseIsOpen=open;motion=open?Motion::OPENING:Motion::CLOSING;lastAction=String(origin)+(open?"_open_":"_close_")+String(ms)+"ms";
-  Serial.printf("[%lu] PSI=%.2f target=%.2f err=%+.2f %s %lums ADC=%.3fV sensor=%.3fV mode=%s fault=%s\n",(unsigned long)now,pressureReady?filteredPsi:NAN,targetPsi,pressureReady?targetPsi-filteredPsi:NAN,open?"OPEN":"CLOSE",(unsigned long)ms,adcV,sensorV,modeName(),faultName());return true;
-}
-void servicePulse(){if(motion!=Motion::STOPPED&&reached(millis(),pulseEndMs))stopValve("pulse_complete");}
-
-void updatePressure(){
-  uint32_t now=millis();if(now-lastReadMs<50)return;lastReadMs=now;uint32_t total=0;
-  for(uint8_t i=0;i<Cfg::ADC_SAMPLES;i++){total+=analogReadMilliVolts(Cfg::PRESSURE_PIN);delayMicroseconds(100);}
-  adcMv=(float)total/Cfg::ADC_SAMPLES;adcV=adcMv/1000.0f;sensorV=adcV/Cfg::DIVIDER_RATIO;
-  rawPsi=((sensorV-Cfg::SENSOR_MIN_V)/(Cfg::SENSOR_MAX_V-Cfg::SENSOR_MIN_V))*Cfg::SENSOR_FS_PSI;
-  sensorValid=isfinite(sensorV)&&sensorV>=Cfg::SENSOR_FAULT_LOW_V&&sensorV<=Cfg::SENSOR_FAULT_HIGH_V;
-  if(!sensorValid){clearZeroHistory();goodSamples=0;fault=Fault::SENSOR;mode=Mode::MANUAL;stopValve("sensor_fault_stop");lastError="Pressure sensor outside 0.20-4.80 V";return;}
-  uint32_t nowMs=millis();if(mode==Mode::MANUAL&&motion==Motion::STOPPED&&reached(nowMs,settleUntilMs))addZeroSample(rawPsi);else clearZeroHistory();
-  float calibratedPsi=rawPsi*Cfg::PRESSURE_GAIN+pressureOffsetPsi;
-  if(goodSamples<5)++goodSamples;
-  if(goodSamples>=5&&fault==Fault::SENSOR){fault=Fault::NONE;pressureReady=false;lastError="";logEvent("sensor_recovered_auto_remains_off");}
-  if(!pressureReady){filteredPsi=calibratedPsi;pressureReady=true;}else filteredPsi=Cfg::FILTER_ALPHA*calibratedPsi+(1-Cfg::FILTER_ALPHA)*filteredPsi;
-}
-uint32_t pulseFor(float e){return e<=1.5f?70:e<=3.0f?110:e<=6.0f?200:325;}
-void serviceControl(){
-  if(!sensorValid||!pressureReady||motion!=Motion::STOPPED)return;uint32_t now=millis();
-  if(!reached(now,settleUntilMs)||now-lastControlMs<Cfg::CONTROL_INTERVAL_MS)return;lastControlMs=now;
-  // A measured overpressure is a close-only safety override, including in MANUAL.
-  if(filteredPsi>Cfg::HARD_MAX_PRESSURE_PSI){if(fault!=Fault::OVERPRESSURE)logEvent("OVERPRESSURE_close_override");fault=Fault::OVERPRESSURE;startPulse(false,300,"overpressure");return;}
-  if(fault==Fault::OVERPRESSURE){if(filteredPsi<Cfg::OVERPRESSURE_CLEAR_PSI){fault=Fault::NONE;logEvent("overpressure_clear");}else{startPulse(false,250,"overpressure");return;}}
-  if(mode!=Mode::AUTO)return;float error=targetPsi-filteredPsi;if(fabsf(error)<=Cfg::DEADBAND_PSI)return;startPulse(error>0,pulseFor(fabsf(error)),"auto");
-}
-
-bool badOrigin(){if(!server.hasHeader("Origin"))return false;String o=server.header("Origin"),h="http://"+server.hostHeader();if(o==h)return false;return o!="https://"+server.hostHeader();}
-void errorJson(int code,const char* msg){server.send(code,"application/json",String("{\"ok\":false,\"error\":\"")+msg+"\"}");}
-bool numberArg(const char* key,float& v){if(!server.hasArg(key))return false;String s=server.arg(key);s.trim();if(!s.length()||s.length()>24)return false;char* end=nullptr;v=strtof(s.c_str(),&end);return end!=s.c_str()&&*end=='\0'&&isfinite(v);}
-void status(){char out[1200];int rssi=WiFi.status()==WL_CONNECTED?WiFi.RSSI():0;String ip=stationConnected?WiFi.localIP().toString():WiFi.softAPIP().toString();const char* sys=fault==Fault::NONE?(sensorValid?"ok":"sensor_fault"):faultName();const char* p=pressureReady?"%.2f":"null";char pressure[24];if(pressureReady)snprintf(pressure,sizeof(pressure),p,filteredPsi);else strcpy(pressure,"null");
-  snprintf(out,sizeof(out),"{\"pressure\":%s,\"rawPressure\":%.3f,\"pressureOffsetPsi\":%.3f,\"target\":%.2f,\"adcMillivolts\":%.1f,\"adcVoltage\":%.4f,\"sensorVoltage\":%.4f,\"mode\":\"%s\",\"valve\":\"%s\",\"fault\":\"%s\",\"system\":\"%s\",\"wifiRssi\":%d,\"wifi\":\"%s\",\"ip\":\"%s\",\"uptimeMs\":%lu,\"lastAction\":\"%s\",\"lastError\":\"%s\",\"valvePosition\":%.1f,\"warning\":\"Throttling is not a static pressure regulator; install rated mechanical relief hardware.\"}",pressure,rawPsi,pressureOffsetPsi,targetPsi,adcMv,adcV,sensorV,modeName(),motionName(),faultName(),sys,rssi,stationConnected?"station+ap":"access_point",ip.c_str(),(unsigned long)millis(),lastAction.c_str(),lastError.c_str(),estimatedPosition);
-  server.send(200,"application/json",out);
-}
-void setpoint(){if(badOrigin())return errorJson(403,"Cross-origin request rejected");float v;if(!numberArg("psi",v)||v<0||v>Cfg::MAX_SETPOINT_PSI)return errorJson(400,"psi must be a finite number from 0 to 100");targetPsi=v;prefs.putFloat("target",v);lastError="";server.send(200,"application/json","{\"ok\":true,\"message\":\"Setpoint saved\"}");}
-void automatic(){if(badOrigin())return errorJson(403,"Cross-origin request rejected");if(!server.hasArg("enabled")||(server.arg("enabled")!="0"&&server.arg("enabled")!="1"))return errorJson(400,"enabled must be 0 or 1");bool on=server.arg("enabled")=="1";if(on&&(!sensorValid||fault==Fault::SENSOR||!pressureReady))return errorJson(409,"AUTO blocked until sensor is valid");if(on&&fault==Fault::OVERPRESSURE)return errorJson(409,"AUTO blocked during overpressure");if(on&&motion!=Motion::STOPPED)return errorJson(409,"Wait for current pulse to finish");mode=on?Mode::AUTO:Mode::MANUAL;lastAction=on?"auto_enabled_by_user":"auto_disabled_by_user";logEvent(on?"AUTO enabled":"AUTO disabled");server.send(200,"application/json",on?"{\"ok\":true,\"message\":\"AUTO enabled\"}":"{\"ok\":true,\"message\":\"AUTO off\"}");}
-void manualPulse(){if(badOrigin())return errorJson(403,"Cross-origin request rejected");if(!sensorValid||fault==Fault::SENSOR)return errorJson(409,"Manual pulse blocked while sensor is faulted");String d=server.arg("direction");if(d!="open"&&d!="close")return errorJson(400,"direction must be open or close");float ms;if(!numberArg("ms",ms)||ms<Cfg::MIN_PULSE_MS||ms>Cfg::MAX_PULSE_MS||floorf(ms)!=ms)return errorJson(400,"ms must be an integer from 20 to 1000");bool open=d=="open";if(open&&(fault==Fault::OVERPRESSURE||filteredPsi>Cfg::HARD_MAX_PRESSURE_PSI))return errorJson(409,"OPEN blocked during overpressure");mode=Mode::MANUAL;if(!startPulse(open,(uint32_t)ms,"manual"))return errorJson(409,"Valve is moving or settling; wait before another pulse");server.send(200,"application/json","{\"ok\":true,\"message\":\"Pulse started\"}");}
-void stopRequest(){if(badOrigin())return errorJson(403,"Cross-origin request rejected");mode=Mode::MANUAL;stopValve("manual_stop_auto_off");lastAction="manual_stop_auto_off";server.send(200,"application/json","{\"ok\":true,\"message\":\"Stopped; AUTO is off\"}");}
-void zeroPressure(){
-  if(badOrigin())return errorJson(403,"Cross-origin request rejected");
-  if(!server.hasArg("confirmed")||server.arg("confirmed")!="1")return errorJson(400,"Explicit confirmation required");
-  if(mode!=Mode::MANUAL)return errorJson(409,"Turn AUTO off before zero calibration");
-  if(motion!=Motion::STOPPED||!reached(millis(),settleUntilMs))return errorJson(409,"Wait until the valve is stopped and settled");
-  if(!sensorValid||fault!=Fault::NONE||!pressureReady)return errorJson(409,"Sensor must be valid with no active fault");
-  float medianRaw=0,spread=0;if(!zeroHistoryStats(medianRaw,spread)||spread>Cfg::ZERO_HISTORY_MAX_SPREAD_PSI)return errorJson(409,"Need 20 stable manual readings before zeroing");
-  float newOffset=-medianRaw*Cfg::PRESSURE_GAIN;if(!isfinite(newOffset)||fabsf(newOffset)>Cfg::MAX_ZERO_OFFSET_PSI)return errorJson(409,"Zero correction exceeds the safe 30 PSI limit; inspect sensor and divider");
-  if(prefs.putFloat("zero_offset",newOffset)!=sizeof(float))return errorJson(500,"Could not save zero calibration");
-  pressureOffsetPsi=newOffset;pressureReady=false;filteredPsi=NAN;clearZeroHistory();lastError="";lastAction="zero_calibrated";logEvent("zero_calibrated");
-  char out[160];snprintf(out,sizeof(out),"{\"ok\":true,\"message\":\"Zero saved at %.2f PSI raw; offset %.2f PSI\",\"rawAtZero\":%.3f,\"offsetPsi\":%.3f}",medianRaw,newOffset,medianRaw,newOffset);server.send(200,"application/json",out);
-}
-
-void setupRoutes(){const char* h[]={"Origin"};server.collectHeaders(h,1);server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",PAGE);});server.on("/api/status",HTTP_GET,status);server.on("/api/setpoint",HTTP_POST,setpoint);server.on("/api/auto",HTTP_POST,automatic);server.on("/api/pulse",HTTP_POST,manualPulse);server.on("/api/stop",HTTP_POST,stopRequest);server.on("/api/zero",HTTP_POST,zeroPressure);server.onNotFound([]{server.send(404,"application/json","{\"ok\":false,\"error\":\"Not found\"}");});}
-void network(){
-  WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);
-  // Keep the fallback AP disjoint from common 192.168.4.x home LANs. In AP+STA
-  // mode, overlapping ranges can route OTA UDP replies out the wrong interface.
-  IPAddress apIp(192,168,10,1),apGateway(192,168,10,1),apSubnet(255,255,255,0);
-  bool apConfig=WiFi.softAPConfig(apIp,apGateway,apSubnet);bool ap=WiFi.softAP(AP_SSID,AP_PASSWORD);
-  Serial.printf("Fallback AP %s (%s, subnet %s), IP %s\n",AP_SSID,ap?"started":"FAILED",apConfig?"configured":"config failed",WiFi.softAPIP().toString().c_str());
-  if(strlen(WIFI_SSID)){WiFi.begin(WIFI_SSID,WIFI_PASSWORD);uint32_t start=millis();while(WiFi.status()!=WL_CONNECTED&&millis()-start<9000){server.handleClient();delay(25);}}
-  stationConnected=WiFi.status()==WL_CONNECTED;if(stationConnected)Serial.printf("Station IP %s RSSI %d dBm\n",WiFi.localIP().toString().c_str(),WiFi.RSSI());else Serial.println("Station unavailable; AP remains active.");
-}
-
-void setupOta(){
-  ArduinoOTA.setHostname("sprinkler-pressure");ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([](){mode=Mode::MANUAL;stopValve("ota_update_stop");Serial.println("Authenticated OTA update started; AUTO off and valve stopped.");});
-  ArduinoOTA.onEnd([](){Serial.println("OTA update complete; rebooting.");});
-  ArduinoOTA.onError([](ota_error_t error){Serial.printf("OTA error %u\n",(unsigned)error);});
-  ArduinoOTA.begin();Serial.println("Authenticated OTA ready (sprinkler-pressure.local, port 3232).");
-}
-
-void setup(){
-  // PWM LOW before Wi-Fi or any lengthy initialization; carrier also has a 100k pull-down.
-  pinMode(Cfg::PWM_PIN,OUTPUT);digitalWrite(Cfg::PWM_PIN,LOW);pinMode(Cfg::DIR_PIN,OUTPUT);digitalWrite(Cfg::DIR_PIN,!Cfg::DIR_OPEN_LEVEL);pinMode(Cfg::PRESSURE_PIN,INPUT);
-  Serial.begin(115200);delay(10);Serial.println("\nBoot SAFE; AUTO remains off.");analogReadResolution(12);analogSetPinAttenuation(Cfg::PRESSURE_PIN,ADC_11db);
-  prefs.begin("pressure",false);targetPsi=prefs.getFloat("target",Cfg::DEFAULT_TARGET_PSI);if(!isfinite(targetPsi)||targetPsi<0||targetPsi>Cfg::MAX_SETPOINT_PSI)targetPsi=Cfg::DEFAULT_TARGET_PSI;
-  pressureOffsetPsi=prefs.getFloat("zero_offset",Cfg::PRESSURE_OFFSET_PSI);if(!isfinite(pressureOffsetPsi)||fabsf(pressureOffsetPsi)>Cfg::MAX_ZERO_OFFSET_PSI)pressureOffsetPsi=Cfg::PRESSURE_OFFSET_PSI;
-  network();setupRoutes();server.begin();setupOta();Serial.printf("Web AP http://%s/\n",WiFi.softAPIP().toString().c_str());if(stationConnected)Serial.printf("Web STA http://%s/\n",WiFi.localIP().toString().c_str());logEvent("boot_safe_auto_off");
-}
-void loop(){server.handleClient();ArduinoOTA.handle();updatePressure();if(!sensorValid&&motion!=Motion::STOPPED)stopValve("sensor_fault_stop");servicePulse();serviceControl();uint32_t now=millis();if(now-lastLogMs>=5000){lastLogMs=now;logEvent("periodic_status");}bool connected=WiFi.status()==WL_CONNECTED;if(stationConnected&&!connected)Serial.printf("[%lu] Station disconnected; fallback AP remains active.\n",(unsigned long)now);if(!stationConnected&&connected)Serial.printf("[%lu] Station reconnected, IP %s.\n",(unsigned long)now,WiFi.localIP().toString().c_str());stationConnected=connected;}
+uint32_t pulseFor(float e){if(e<=tuning.error1Psi)return tuning.pulse1Ms;if(e<=tuning.error2Psi)return tuning.pulse2Ms;if(e<=tuning.error3Psi)return tuning.pulse3Ms;return tuning.pulse4Ms;}
+void serviceControl(){if(!sensorValid||!pressureReady||motion!=Motion::STOPPED||!due(millis(),settleUntil)||millis()-lastControl<tuning.controlIntervalMs)return;lastControl=millis();if(filteredPsi>Cfg::HARD_MAX_PRESSURE_PSI){fault=Fault::OVERPRESSURE;startPulse(false,300,"safety");return;}if(fault==Fault::OVERPRESSURE){if(filteredPsi<Cfg::OVERPRESSURE_CLEAR_PSI)fault=Fault::NONE;else{startPulse(false,250,"safety");return;}}if(mode!=Mode::AUTO||!positionKnown)return;float err=targetPsi-filteredPsi;if(fabsf(err)<=tuning.deadbandPsi)return;float scale=fabsf(err)<=tuning.error1Psi?.65f:1.f;startPulse(err>0,max((uint32_t)Cfg::MIN_PULSE_MS,(uint32_t)(pulseFor(fabsf(err))*scale)),"auto");}
+bool badOrigin(){if(!server.hasHeader("Origin"))return false;String o=server.header("Origin"),h="http://"+server.hostHeader();return o!=h;}
+void sendError(int code,const char* message){server.send(code,"application/json",String("{\"ok\":false,\"error\":\"")+message+"\"}");}
+bool argFloat(const char* key,float& out){if(!server.hasArg(key))return false;String s=server.arg(key);s.trim();if(!s.length()||s.length()>24)return false;char* e=nullptr;out=strtof(s.c_str(),&e);return e!=s.c_str()&&*e=='\0'&&isfinite(out);}
+bool argUInt(const char* key,uint32_t& out){float f;if(!argFloat(key,f)||f<0||f>120000||floorf(f)!=f)return false;out=(uint32_t)f;return true;}
+void status(){char pressure[24];if(pressureReady)snprintf(pressure,sizeof(pressure),"%.2f",filteredPsi);else strcpy(pressure,"null");String ip=stationConnected?WiFi.localIP().toString():WiFi.softAPIP().toString();char out[1700];snprintf(out,sizeof(out),"{\"pressure\":%s,\"rawPressure\":%.3f,\"pressureOffsetPsi\":%.3f,\"filterAlpha\":%.3f,\"target\":%.2f,\"adcMillivolts\":%.1f,\"adcVoltage\":%.4f,\"sensorVoltage\":%.4f,\"mode\":\"%s\",\"valve\":\"%s\",\"fault\":\"%s\",\"system\":\"%s\",\"wifiRssi\":%d,\"wifi\":\"%s\",\"ip\":\"%s\",\"uptimeMs\":%lu,\"lastAction\":\"%s\",\"lastError\":\"%s\",\"valvePosition\":%.1f,\"positionKnown\":%s,\"referenceActive\":%s,\"referenceDirection\":\"%s\",\"referencePulseUsedMs\":%lu,\"referencePulseBudgetMs\":%lu,\"zeroCaptureActive\":%s,\"zeroCaptureSamples\":%u,\"zeroCaptureProgress\":%u,\"zeroCaptureError\":\"%s\",\"warning\":\"Throttling is not a static pressure regulator; install rated mechanical relief hardware.\"}",pressure,rawPsi,pressureOffsetPsi,tuning.filterAlpha,targetPsi,adcMv,adcV,sensorV,modeName(),motionName(),faultName(),fault==Fault::NONE?(sensorValid?"ok":"sensor_fault"):faultName(),stationConnected?WiFi.RSSI():0,stationConnected?"station+ap":"access_point",ip.c_str(),(unsigned long)millis(),lastAction.c_str(),lastError.c_str(),estimatedPosition,positionKnown?"true":"false",refDir!=RefDir::NONE?"true":"false",refDir==RefDir::OPEN?"open":refDir==RefDir::CLOSE?"close":"none",(unsigned long)referenceUsed,(unsigned long)(refDir==RefDir::OPEN?tuning.openTravelMs+tuning.openOvertravelMs:refDir==RefDir::CLOSE?tuning.closeTravelMs+tuning.closeOvertravelMs:0),zeroActive?"true":"false",zeroCount,(unsigned)(zeroCount*100/Cfg::ZERO_SAMPLES),zeroError.c_str());server.send(200,"application/json",out);}
+void getConfig(){char out[900];snprintf(out,sizeof(out),"{\"filterAlpha\":%.3f,\"deadbandPsi\":%.3f,\"controlIntervalMs\":%lu,\"settleMs\":%lu,\"error1Psi\":%.3f,\"error2Psi\":%.3f,\"error3Psi\":%.3f,\"pulse1Ms\":%lu,\"pulse2Ms\":%lu,\"pulse3Ms\":%lu,\"pulse4Ms\":%lu,\"openTravelMs\":%lu,\"closeTravelMs\":%lu,\"openOvertravelMs\":%lu,\"closeOvertravelMs\":%lu}",tuning.filterAlpha,tuning.deadbandPsi,(unsigned long)tuning.controlIntervalMs,(unsigned long)tuning.settleMs,tuning.error1Psi,tuning.error2Psi,tuning.error3Psi,(unsigned long)tuning.pulse1Ms,(unsigned long)tuning.pulse2Ms,(unsigned long)tuning.pulse3Ms,(unsigned long)tuning.pulse4Ms,(unsigned long)tuning.openTravelMs,(unsigned long)tuning.closeTravelMs,(unsigned long)tuning.openOvertravelMs,(unsigned long)tuning.closeOvertravelMs);server.send(200,"application/json",out);}
+void saveConfig(){if(badOrigin())return sendError(403,"Cross-origin request rejected");TuningConfig c; c=tuning;uint32_t* ints[]={&c.controlIntervalMs,&c.settleMs,&c.pulse1Ms,&c.pulse2Ms,&c.pulse3Ms,&c.pulse4Ms,&c.openTravelMs,&c.closeTravelMs,&c.openOvertravelMs,&c.closeOvertravelMs};const char* ik[]={"controlIntervalMs","settleMs","pulse1Ms","pulse2Ms","pulse3Ms","pulse4Ms","openTravelMs","closeTravelMs","openOvertravelMs","closeOvertravelMs"};float* fs[]={&c.filterAlpha,&c.deadbandPsi,&c.error1Psi,&c.error2Psi,&c.error3Psi};const char* fk[]={"filterAlpha","deadbandPsi","error1Psi","error2Psi","error3Psi"};for(int i=0;i<10;i++)if(!argUInt(ik[i],*ints[i]))return sendError(400,"Missing or invalid integer config field");for(int i=0;i<5;i++)if(!argFloat(fk[i],*fs[i]))return sendError(400,"Missing or invalid numeric config field");
+  if(c.filterAlpha<.01f||c.filterAlpha>1||c.deadbandPsi<.05f||c.deadbandPsi>20||c.controlIntervalMs<50||c.controlIntervalMs>5000||c.settleMs>10000||c.error1Psi<=0||c.error2Psi<=c.error1Psi||c.error3Psi<=c.error2Psi||c.pulse1Ms<20||c.pulse1Ms>1000||c.pulse2Ms<20||c.pulse2Ms>1000||c.pulse3Ms<20||c.pulse3Ms>1000||c.pulse4Ms<20||c.pulse4Ms>1000||c.openTravelMs<Cfg::MIN_TRAVEL_MS||c.closeTravelMs<Cfg::MIN_TRAVEL_MS||c.openTravelMs>Cfg::MAX_TRAVEL_MS||c.closeTravelMs>Cfg::MAX_TRAVEL_MS||c.openOvertravelMs>Cfg::MAX_OVERTRAVEL_MS||c.closeOvertravelMs>Cfg::MAX_OVERTRAVEL_MS)return sendError(400,"Config value outside allowed range");
+  tuning=c;prefs.putBytes("tuning",&tuning,sizeof(tuning));server.send(200,"application/json","{\"ok\":true,\"message\":\"Controller settings saved\"}");}
+void setpoint(){float v;if(badOrigin())return sendError(403,"Cross-origin request rejected");if(!argFloat("psi",v)||v<0||v>Cfg::MAX_SETPOINT_PSI)return sendError(400,"psi must be 0 to 100");targetPsi=v;prefs.putFloat("target",v);server.send(200,"application/json","{\"ok\":true,\"message\":\"Setpoint saved\"}");}
+void automatic(){if(badOrigin())return sendError(403,"Cross-origin request rejected");bool on=server.arg("enabled")=="1";if(!on&&server.arg("enabled")=="0"){mode=Mode::MANUAL;server.send(200,"application/json","{\"ok\":true,\"message\":\"AUTO off\"}");return;}if(!on)return sendError(400,"enabled must be 0 or 1");if(!sensorValid||!pressureReady||fault!=Fault::NONE)return sendError(409,"AUTO blocked until sensor is valid and fault free");if(!positionKnown)return sendError(409,"AUTO blocked until position is referenced");if(motion!=Motion::STOPPED)return sendError(409,"Wait for current pulse to finish");mode=Mode::AUTO;server.send(200,"application/json","{\"ok\":true,\"message\":\"AUTO enabled\"}");}
+void pulseApi(){if(badOrigin())return sendError(403,"Cross-origin request rejected");if(mode!=Mode::MANUAL||!sensorValid||fault!=Fault::NONE)return sendError(409,"Manual pulse blocked by controller state");String d=server.arg("direction");bool open=d=="open";if(!open&&d!="close")return sendError(400,"direction must be open or close");uint32_t ms;if(!argUInt("ms",ms)||ms<Cfg::MIN_PULSE_MS||ms>Cfg::MAX_PULSE_MS)return sendError(400,"Pulse must be 20 to 1000 ms");if(!startPulse(open,ms,"manual"))return sendError(409,"Start matching bounded reference first, or wait until stopped and settled");server.send(200,"application/json","{\"ok\":true,\"message\":\"Pulse started\"}");}
+void stopApi(){mode=Mode::MANUAL;refDir=RefDir::NONE;zeroActive=false;stopValve("manual_stop");lastAction="manual_stop_auto_off";server.send(200,"application/json","{\"ok\":true,\"message\":\"Stopped; AUTO off\"}");}
+void zeroApi(){if(badOrigin())return sendError(403,"Cross-origin request rejected");if(server.arg("confirmed")!="1")return sendError(400,"Explicit confirmation required");if(mode!=Mode::MANUAL||motion!=Motion::STOPPED||!due(millis(),settleUntil)||!sensorValid||fault!=Fault::NONE||!pressureReady)return sendError(409,"Requires valid sensor, MANUAL, stopped and settled");zeroCount=0;zeroError="";zeroStart=millis();zeroActive=true;server.send(202,"application/json","{\"ok\":true,\"message\":\"Capturing fresh samples for 3 seconds\"}");}
+void referenceStart(){if(badOrigin())return sendError(403,"Cross-origin request rejected");if(mode!=Mode::MANUAL||motion!=Motion::STOPPED||!due(millis(),settleUntil))return sendError(409,"Reference requires stopped MANUAL mode");String d=server.arg("direction");if(d!="open"&&d!="close")return sendError(400,"direction must be open or close");refDir=d=="open"?RefDir::OPEN:RefDir::CLOSE;referenceUsed=0;positionKnown=false;server.send(200,"application/json","{\"ok\":true,\"message\":\"Bounded manual reference started\"}");}
+void referenceMark(){if(badOrigin())return sendError(403,"Cross-origin request rejected");if(server.arg("confirmed")!="1"||refDir==RefDir::NONE||motion!=Motion::STOPPED||!due(millis(),settleUntil))return sendError(409,"Confirm an active stopped reference session");estimatedPosition=refDir==RefDir::OPEN?100.f:0.f;positionKnown=true;refDir=RefDir::NONE;referenceUsed=0;server.send(200,"application/json","{\"ok\":true,\"message\":\"Estimated position reference saved; not a mechanical endstop\"}");}
+void wifiGet(){String out="{\"ssid\":\""+jsonEscape(stationSsid)+"\",\"state\":\""+jsonEscape(wifiState)+"\",\"ip\":\""+(stationConnected?WiFi.localIP().toString():String(""))+"\",\"error\":\""+jsonEscape(wifiError)+"\",\"fallbackAp\":\""+WiFi.softAPIP().toString()+"\"}";server.send(200,"application/json",out);}
+void wifiPost(){if(badOrigin())return sendError(403,"Cross-origin request rejected");if(wifiChangePending)return sendError(409,"Wi-Fi change already in progress");String ssid=server.arg("ssid"),pass=server.arg("password");if(!ssid.length()||ssid.length()>32||pass.length()>63)return sendError(400,"SSID must be 1–32 chars and password 0–63");previousSsid=stationSsid;previousPassword=stationPassword;pendingSsid=ssid;pendingPassword=pass;wifiChangePending=true;wifiRollback=false;wifiSwitchScheduled=true;wifiSwitchAt=millis()+1000;wifiState="connecting";wifiError="";server.send(202,"application/json","{\"ok\":true,\"message\":\"Wi-Fi connection attempt scheduled; fallback AP remains available\"}");}
+void serviceWifi(){if(!wifiChangePending)return;if(wifiSwitchScheduled){if(!due(millis(),wifiSwitchAt))return;wifiSwitchScheduled=false;wifiAttemptStart=millis();WiFi.disconnect(false,false);WiFi.begin(pendingSsid.c_str(),pendingPassword.c_str());return;}if(WiFi.status()==WL_CONNECTED){stationConnected=true;if(!wifiRollback){stationSsid=pendingSsid;stationPassword=pendingPassword;prefs.putString("wifi_ssid",stationSsid);prefs.putString("wifi_pass",stationPassword);wifiState="connected";wifiError="";}else{wifiState="restored_previous";}wifiChangePending=false;pendingPassword="";previousPassword="";logEvent("station_wifi_changed");return;}if(millis()-wifiAttemptStart<15000)return;if(!wifiRollback){wifiRollback=true;wifiState="restoring_previous";wifiError="Could not connect to requested network; restoring previous station";pendingSsid=previousSsid;pendingPassword=previousPassword;wifiAttemptStart=millis();WiFi.disconnect(false,false);if(pendingSsid.length())WiFi.begin(pendingSsid.c_str(),pendingPassword.c_str());else{wifiChangePending=false;stationConnected=false;wifiState="failed_ap_available";pendingPassword="";previousPassword="";}}else{wifiChangePending=false;stationConnected=false;wifiState="failed_ap_available";wifiError="Previous station unavailable; fallback access point remains active";pendingPassword="";previousPassword="";}}
+void routes(){const char* h[]={"Origin"};server.collectHeaders(h,1);server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",PAGE);});server.on("/api/status",HTTP_GET,status);server.on("/api/config",HTTP_GET,getConfig);server.on("/api/config",HTTP_POST,saveConfig);server.on("/api/setpoint",HTTP_POST,setpoint);server.on("/api/auto",HTTP_POST,automatic);server.on("/api/pulse",HTTP_POST,pulseApi);server.on("/api/stop",HTTP_POST,stopApi);server.on("/api/zero",HTTP_POST,zeroApi);server.on("/api/reference/start",HTTP_POST,referenceStart);server.on("/api/reference/mark",HTTP_POST,referenceMark);server.on("/api/wifi",HTTP_GET,wifiGet);server.on("/api/wifi",HTTP_POST,wifiPost);server.onNotFound([](){server.send(404,"application/json","{\"ok\":false,\"error\":\"Not found\"}");});}
+void network(){WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);IPAddress ip(192,168,10,1),gw(192,168,10,1),mask(255,255,255,0);WiFi.softAPConfig(ip,gw,mask);WiFi.softAP(AP_SSID,AP_PASSWORD);stationSsid=prefs.getString("wifi_ssid",WIFI_SSID);stationPassword=prefs.getString("wifi_pass",WIFI_PASSWORD);if(stationSsid.length()){WiFi.begin(stationSsid.c_str(),stationPassword.c_str());uint32_t start=millis();while(WiFi.status()!=WL_CONNECTED&&millis()-start<9000){server.handleClient();delay(25);}}stationConnected=WiFi.status()==WL_CONNECTED;wifiState=stationConnected?"connected":"access_point_only";}
+void loadConfig(){TuningConfig stored;if(prefs.getBytesLength("tuning")==sizeof(stored)){prefs.getBytes("tuning",&stored,sizeof(stored));tuning=stored;}}
+void setupOta(){ArduinoOTA.setHostname("sprinkler-pressure");ArduinoOTA.setPassword(OTA_PASSWORD);ArduinoOTA.onStart([](){mode=Mode::MANUAL;refDir=RefDir::NONE;stopValve("ota_update_stop");Serial.println("Authenticated OTA started; AUTO off.");});ArduinoOTA.begin();}
+void setup(){pinMode(Cfg::PWM_PIN,OUTPUT);digitalWrite(Cfg::PWM_PIN,LOW);pinMode(Cfg::DIR_PIN,OUTPUT);digitalWrite(Cfg::DIR_PIN,!Cfg::DIR_OPEN_LEVEL);pinMode(Cfg::PRESSURE_PIN,INPUT);Serial.begin(115200);delay(10);analogReadResolution(12);analogSetPinAttenuation(Cfg::PRESSURE_PIN,ADC_11db);prefs.begin("pressure",false);targetPsi=prefs.getFloat("target",20.f);pressureOffsetPsi=prefs.getFloat("zero_offset",0.f);loadConfig();if(!isfinite(tuning.filterAlpha)||tuning.filterAlpha<.01f||tuning.filterAlpha>1)tuning=TuningConfig();routes();network();server.begin();setupOta();Serial.printf("Boot safe, AUTO off. AP IP %s\n",WiFi.softAPIP().toString().c_str());}
+void loop(){server.handleClient();ArduinoOTA.handle();updatePressure();servicePulse();serviceControl();serviceWifi();stationConnected=WiFi.status()==WL_CONNECTED;}
