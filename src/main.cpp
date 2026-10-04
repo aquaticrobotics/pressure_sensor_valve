@@ -156,7 +156,16 @@ void zeroPressure(){
 }
 
 void setupRoutes(){const char* h[]={"Origin"};server.collectHeaders(h,1);server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",PAGE);});server.on("/api/status",HTTP_GET,status);server.on("/api/setpoint",HTTP_POST,setpoint);server.on("/api/auto",HTTP_POST,automatic);server.on("/api/pulse",HTTP_POST,manualPulse);server.on("/api/stop",HTTP_POST,stopRequest);server.on("/api/zero",HTTP_POST,zeroPressure);server.onNotFound([]{server.send(404,"application/json","{\"ok\":false,\"error\":\"Not found\"}");});}
-void network(){WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);bool ap=WiFi.softAP(AP_SSID,AP_PASSWORD);Serial.printf("Fallback AP %s (%s), IP %s\n",AP_SSID,ap?"started":"FAILED",WiFi.softAPIP().toString().c_str());if(strlen(WIFI_SSID)){WiFi.begin(WIFI_SSID,WIFI_PASSWORD);uint32_t start=millis();while(WiFi.status()!=WL_CONNECTED&&millis()-start<9000){server.handleClient();delay(25);}}stationConnected=WiFi.status()==WL_CONNECTED;if(stationConnected)Serial.printf("Station IP %s RSSI %d dBm\n",WiFi.localIP().toString().c_str(),WiFi.RSSI());else Serial.println("Station unavailable; AP remains active.");}
+void network(){
+  WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);
+  // Keep the fallback AP disjoint from common 192.168.4.x home LANs. In AP+STA
+  // mode, overlapping ranges can route OTA UDP replies out the wrong interface.
+  IPAddress apIp(192,168,10,1),apGateway(192,168,10,1),apSubnet(255,255,255,0);
+  bool apConfig=WiFi.softAPConfig(apIp,apGateway,apSubnet);bool ap=WiFi.softAP(AP_SSID,AP_PASSWORD);
+  Serial.printf("Fallback AP %s (%s, subnet %s), IP %s\n",AP_SSID,ap?"started":"FAILED",apConfig?"configured":"config failed",WiFi.softAPIP().toString().c_str());
+  if(strlen(WIFI_SSID)){WiFi.begin(WIFI_SSID,WIFI_PASSWORD);uint32_t start=millis();while(WiFi.status()!=WL_CONNECTED&&millis()-start<9000){server.handleClient();delay(25);}}
+  stationConnected=WiFi.status()==WL_CONNECTED;if(stationConnected)Serial.printf("Station IP %s RSSI %d dBm\n",WiFi.localIP().toString().c_str(),WiFi.RSSI());else Serial.println("Station unavailable; AP remains active.");
+}
 
 void setupOta(){
   ArduinoOTA.setHostname("sprinkler-pressure");ArduinoOTA.setPassword(OTA_PASSWORD);
