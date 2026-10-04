@@ -1,6 +1,7 @@
 .pio/
 .vscode/
 include/secrets.h
+platformio.local.ini
 *.bin
 *.elf
 *.map

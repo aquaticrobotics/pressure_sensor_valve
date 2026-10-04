@@ -49,17 +49,20 @@ The ratio is 20k/(10k+20k)=2/3: 0.5 V sensor output becomes about 0.333 V at GPI
 4. Connect the ESP32 over USB, identify its serial port, then flash: `pio run -t upload`.
 5. Serial monitor: 115200 baud.
 
+The first install of OTA support must use USB/serial. After that, build and upload over the trusted Wi-Fi with `pio run -e esp32ota -t upload`. The `esp32ota` environment uses authenticated OTA and defaults to the current controller IP; update `upload_port` if its DHCP address changes. Keep the OTA password in ignored `include/secrets.h` and `platformio.local.ini`, matching values in both files. Do not use the example password on a real network.
+
 The fallback AP starts even if station credentials are used. Default SSID is `SprinklerController`; `ChangeMe123` is only a placeholder. Serial prints AP/station IPs. Browse to `http://<controller-ip>/`.
 
 ## UI and REST API
 
-The mobile UI displays pressure, target, AUTO/MANUAL, valve motion, fault, ADC values, Wi-Fi and uptime; it refreshes every 500 ms. Controls are target set, AUTO on/off, OPEN/CLOSE 100/300 ms, and STOP. STOP also turns AUTO off.
+The mobile UI displays pressure, target, AUTO/MANUAL, valve motion, fault, ADC values, Wi-Fi and uptime; it refreshes every 500 ms. Controls are target set, AUTO on/off, OPEN/CLOSE 100/300 ms, STOP, and a guarded zero-calibration action. STOP also turns AUTO off.
 
 - `GET /api/status`
 - `POST /api/setpoint` form field `psi`: finite 0–100, persisted in Preferences
 - `POST /api/auto` field `enabled=0|1`
 - `POST /api/pulse` fields `direction=open|close`, integer `ms=20..1000`
 - `POST /api/stop`
+- `POST /api/zero` field `confirmed=1`: stores a zero offset in ESP32 Preferences without reflashing. Requires MANUAL, a stopped/settled valve, valid sensor, no fault, and 20 stable raw samples spanning no more than 1 PSI. The UI confirms that the gauge sensor port is vented to atmosphere.
 
 The local UI/API has no user authentication. Keep the AP password private and use a trusted LAN. Mismatched browser Origin requests are rejected; this is not authentication.
 
@@ -73,14 +76,16 @@ rawPressurePsi = (sensorVoltage - 0.5) * 37.5
 calibratedPressure = rawPressurePsi * PRESSURE_GAIN + PRESSURE_OFFSET_PSI
 ```
 
-Defaults are gain 1.0 and offset 0.0. Compare firmware to a known mechanical gauge at two points:
+The default gain is 1.0 and default offset is 0.0. The UI's **Zero sensor at atmosphere** action computes and saves an offset persistently in ESP32 Preferences; it is kept across reboot and firmware uploads. Use it only with a gauge-pressure sensor truly vented to atmosphere, correct divider wiring, AUTO off, and the valve stopped. The endpoint refuses unstable samples and corrections larger than 30 PSI. Zeroing corrects only the offset; it does not verify the span or divider ratio.
+
+Compare firmware to a known mechanical gauge at two pressures before enabling closed-loop control:
 
 ```text
 GAIN = (P2 - P1) / (R2 - R1)
 OFFSET = P1 - GAIN * R1
 ```
 
-Set those constants in `src/main.cpp`, rebuild, then verify both points. The sensor voltage fault window is 0.20–4.80 V.
+If changing gain manually, set it in `src/main.cpp` and rebuild. The zero offset can be set from the UI without reflashing. The sensor voltage fault window is 0.20–4.80 V.
 
 ## Control behavior
 
