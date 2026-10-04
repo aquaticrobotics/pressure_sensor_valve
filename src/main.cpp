@@ -80,10 +80,18 @@ const char* faultName(){return fault==Fault::SENSOR?"sensor":fault==Fault::OVERP
 bool reached(uint32_t now,uint32_t deadline){return static_cast<int32_t>(now-deadline)>=0;}
 void clearZeroHistory(){zeroHistoryCount=0;zeroHistoryNext=0;}
 void addZeroSample(float psi){zeroHistory[zeroHistoryNext]=psi;zeroHistoryNext=(zeroHistoryNext+1)%Cfg::ZERO_HISTORY_SAMPLES;if(zeroHistoryCount<Cfg::ZERO_HISTORY_SAMPLES)++zeroHistoryCount;}
-bool zeroHistoryStats(float& mean,float& spread){
-  if(zeroHistoryCount<Cfg::ZERO_HISTORY_SAMPLES)return false;float total=0,lo=INFINITY,hi=-INFINITY;
-  for(uint8_t i=0;i<zeroHistoryCount;i++){float v=zeroHistory[i];total+=v;if(v<lo)lo=v;if(v>hi)hi=v;}
-  mean=total/zeroHistoryCount;spread=hi-lo;return isfinite(mean)&&isfinite(spread);
+bool zeroHistoryStats(float& center,float& spread){
+  if(zeroHistoryCount<Cfg::ZERO_HISTORY_SAMPLES)return false;
+  float sorted[Cfg::ZERO_HISTORY_SAMPLES];
+  for(uint8_t i=0;i<zeroHistoryCount;i++){
+    float value=zeroHistory[i];uint8_t j=i;
+    while(j>0&&sorted[j-1]>value){sorted[j]=sorted[j-1];--j;}
+    sorted[j]=value;
+  }
+  uint8_t lowIndex=zeroHistoryCount/10,highIndex=(zeroHistoryCount*9)/10;
+  center=(sorted[(zeroHistoryCount-1)/2]+sorted[zeroHistoryCount/2])*0.5f;
+  spread=sorted[highIndex]-sorted[lowIndex];
+  return isfinite(center)&&isfinite(spread);
 }
 void logEvent(const char* what){Serial.printf("[%lu] %s PSI=%.2f target=%.2f ADC=%.3fV sensor=%.3fV mode=%s valve=%s fault=%s\n",(unsigned long)millis(),what,pressureReady?filteredPsi:NAN,targetPsi,adcV,sensorV,modeName(),motionName(),faultName());}
 
@@ -140,11 +148,11 @@ void zeroPressure(){
   if(mode!=Mode::MANUAL)return errorJson(409,"Turn AUTO off before zero calibration");
   if(motion!=Motion::STOPPED||!reached(millis(),settleUntilMs))return errorJson(409,"Wait until the valve is stopped and settled");
   if(!sensorValid||fault!=Fault::NONE||!pressureReady)return errorJson(409,"Sensor must be valid with no active fault");
-  float meanRaw=0,spread=0;if(!zeroHistoryStats(meanRaw,spread)||spread>Cfg::ZERO_HISTORY_MAX_SPREAD_PSI)return errorJson(409,"Need 20 stable manual readings before zeroing");
-  float newOffset=-meanRaw*Cfg::PRESSURE_GAIN;if(!isfinite(newOffset)||fabsf(newOffset)>Cfg::MAX_ZERO_OFFSET_PSI)return errorJson(409,"Zero correction exceeds the safe 30 PSI limit; inspect sensor and divider");
+  float medianRaw=0,spread=0;if(!zeroHistoryStats(medianRaw,spread)||spread>Cfg::ZERO_HISTORY_MAX_SPREAD_PSI)return errorJson(409,"Need 20 stable manual readings before zeroing");
+  float newOffset=-medianRaw*Cfg::PRESSURE_GAIN;if(!isfinite(newOffset)||fabsf(newOffset)>Cfg::MAX_ZERO_OFFSET_PSI)return errorJson(409,"Zero correction exceeds the safe 30 PSI limit; inspect sensor and divider");
   if(prefs.putFloat("zero_offset",newOffset)!=sizeof(float))return errorJson(500,"Could not save zero calibration");
   pressureOffsetPsi=newOffset;pressureReady=false;filteredPsi=NAN;clearZeroHistory();lastError="";lastAction="zero_calibrated";logEvent("zero_calibrated");
-  char out[160];snprintf(out,sizeof(out),"{\"ok\":true,\"message\":\"Zero saved at %.2f PSI raw; offset %.2f PSI\",\"rawAtZero\":%.3f,\"offsetPsi\":%.3f}",meanRaw,newOffset, newOffset);server.send(200,"application/json",out);
+  char out[160];snprintf(out,sizeof(out),"{\"ok\":true,\"message\":\"Zero saved at %.2f PSI raw; offset %.2f PSI\",\"rawAtZero\":%.3f,\"offsetPsi\":%.3f}",medianRaw,newOffset,newOffset);server.send(200,"application/json",out);
 }
 
 void setupRoutes(){const char* h[]={"Origin"};server.collectHeaders(h,1);server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",PAGE);});server.on("/api/status",HTTP_GET,status);server.on("/api/setpoint",HTTP_POST,setpoint);server.on("/api/auto",HTTP_POST,automatic);server.on("/api/pulse",HTTP_POST,manualPulse);server.on("/api/stop",HTTP_POST,stopRequest);server.on("/api/zero",HTTP_POST,zeroPressure);server.onNotFound([]{server.send(404,"application/json","{\"ok\":false,\"error\":\"Not found\"}");});}

@@ -62,7 +62,7 @@ The mobile UI displays pressure, target, AUTO/MANUAL, valve motion, fault, ADC v
 - `POST /api/auto` field `enabled=0|1`
 - `POST /api/pulse` fields `direction=open|close`, integer `ms=20..1000`
 - `POST /api/stop`
-- `POST /api/zero` field `confirmed=1`: stores a zero offset in ESP32 Preferences without reflashing. Requires MANUAL, a stopped/settled valve, valid sensor, no fault, and 20 stable raw samples spanning no more than 1 PSI. The UI confirms that the gauge sensor port is vented to atmosphere.
+- `POST /api/zero` field `confirmed=1`: stores a zero offset in ESP32 Preferences without reflashing. Requires MANUAL, a stopped/settled valve, valid sensor, no fault, and 20 stable raw samples whose central 80% spans no more than 1 PSI. The median raw reading sets the offset, reducing sensitivity to brief ADC outliers. The UI confirms that the gauge sensor port is vented to atmosphere.
 
 The local UI/API has no user authentication. Keep the AP password private and use a trusted LAN. Mismatched browser Origin requests are rejected; this is not authentication.
 
