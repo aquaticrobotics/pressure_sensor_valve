@@ -49,7 +49,7 @@ The ratio is 20k/(10k+20k)=2/3: 0.5 V sensor output becomes about 0.333 V at GPI
 4. Connect the ESP32 over USB, identify its serial port, then flash: `pio run -t upload`.
 5. Serial monitor: 115200 baud.
 
-The first install of OTA support must use USB/serial. After that, build and upload over the trusted Wi-Fi with `pio run -e esp32ota -t upload`. The `esp32ota` environment uses authenticated OTA and defaults to the current controller IP; update `upload_port` if its DHCP address changes. Keep the OTA password in ignored `include/secrets.h` and `platformio.local.ini`, matching values in both files. Do not use the example password on a real network.
+The first install of OTA support must use USB/serial. After that, build and upload over the trusted Wi-Fi with `pio run -e esp32ota -t upload`. The `esp32ota` environment uses authenticated OTA and defaults to the current controller IP; update `upload_port` if its DHCP address changes. On Windows, allow inbound TCP and UDP port 3232 only from `LocalSubnet` on the `Private` profile; the uploader pins both sockets to that port. Keep the OTA password in ignored `include/secrets.h` and `platformio.local.ini`, matching values in both files. Do not use the example password on a real network.
 
 The fallback AP starts even if station credentials are used. Default SSID is `SprinklerController`; `ChangeMe123` is only a placeholder. Serial prints AP/station IPs. Browse to `http://<controller-ip>/`.
 
